@@ -178,7 +178,9 @@ class Crawler:
                 with list_path.open("r", encoding="utf-8") as f:
                     post_list = json.load(f)
             else:
-                post_list = self.fetch_post_list(limit=limit, offset=current_offset, sort=sort)
+                post_list = self.fetch_post_list(
+                    limit=limit, offset=current_offset, sort=sort
+                )
                 self._save_json(list_path, post_list)
 
             posts = post_list.get("posts") or []
@@ -196,7 +198,14 @@ class Crawler:
                     with detail_path.open("r", encoding="utf-8") as f:
                         detail = json.load(f)
                 else:
-                    detail = self.fetch_post_detail(post_id)
+                    try:
+                        detail = self.fetch_post_detail(post_id)
+                    except Exception as exc:  # noqa: BLE001 - keep crawl moving
+                        print(
+                            f"Failed to fetch detail for {post_id}: {exc}",
+                            file=sys.stderr,
+                        )
+                        continue
                     self._save_json(detail_path, detail)
 
                 normalized = self.normalize_post_bundle(
@@ -224,7 +233,9 @@ class Crawler:
                 self.sleep_cfg.sleep()
 
             has_more = bool(post_list.get("has_more"))
-            current_offset = int(post_list.get("next_offset") or (current_offset + limit))
+            current_offset = int(
+                post_list.get("next_offset") or (current_offset + limit)
+            )
 
             self._save_json(
                 status_path,
@@ -246,8 +257,12 @@ class Crawler:
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Crawl Moltbook posts and comments.")
-    parser.add_argument("--config", default="crawler_config.json", help="Config file path")
-    parser.add_argument("--crawler-id", default=None, help="Crawler id for status/resume")
+    parser.add_argument(
+        "--config", default="crawler_config.json", help="Config file path"
+    )
+    parser.add_argument(
+        "--crawler-id", default=None, help="Crawler id for status/resume"
+    )
     parser.add_argument("--out-dir", default=None, help="Output directory")
     parser.add_argument("--limit", type=int, default=None, help="Posts per page")
     parser.add_argument("--offset", type=int, default=None, help="Start offset")
@@ -258,12 +273,33 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=None,
         help="Max pages to crawl (0 = no limit)",
     )
-    parser.add_argument("--sleep-min", type=float, default=None, help="Min sleep seconds")
-    parser.add_argument("--sleep-max", type=float, default=None, help="Max sleep seconds")
-    parser.add_argument("--timeout", type=float, default=None, help="Request timeout seconds")
-    parser.add_argument("--retries", type=int, default=None, help="Max retries per request")
-    parser.add_argument("--force", action="store_true", help="Re-download existing files")
-    parser.add_argument("--resume", action="store_true", help="Resume from status.json")
+    parser.add_argument(
+        "--sleep-min", type=float, default=None, help="Min sleep seconds"
+    )
+    parser.add_argument(
+        "--sleep-max", type=float, default=None, help="Max sleep seconds"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=None, help="Request timeout seconds"
+    )
+    parser.add_argument(
+        "--retries", type=int, default=None, help="Max retries per request"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Re-download existing files"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Resume from status.json (default: true)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_false",
+        dest="resume",
+        help="Disable resume from status.json",
+    )
     return parser.parse_args(list(argv))
 
 
@@ -283,7 +319,9 @@ def _write_config(path: Path, data: Dict[str, Any]) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def _resolve_settings(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_settings(
+    args: argparse.Namespace, config: Dict[str, Any]
+) -> Dict[str, Any]:
     defaults = {
         "crawler_id": "default",
         "out_dir": "data",
@@ -298,16 +336,46 @@ def _resolve_settings(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[
     }
 
     resolved = {
-        "crawler_id": args.crawler_id or config.get("crawler_id") or defaults["crawler_id"],
+        "crawler_id": args.crawler_id
+        or config.get("crawler_id")
+        or defaults["crawler_id"],
         "out_dir": args.out_dir or config.get("out_dir") or defaults["out_dir"],
-        "limit": args.limit if args.limit is not None else config.get("limit", defaults["limit"]),
-        "offset": args.offset if args.offset is not None else config.get("offset", defaults["offset"]),
+        "limit": (
+            args.limit
+            if args.limit is not None
+            else config.get("limit", defaults["limit"])
+        ),
+        "offset": (
+            args.offset
+            if args.offset is not None
+            else config.get("offset", defaults["offset"])
+        ),
         "sort": args.sort or config.get("sort") or defaults["sort"],
-        "max_pages": args.max_pages if args.max_pages is not None else config.get("max_pages", defaults["max_pages"]),
-        "sleep_min": args.sleep_min if args.sleep_min is not None else config.get("sleep_min", defaults["sleep_min"]),
-        "sleep_max": args.sleep_max if args.sleep_max is not None else config.get("sleep_max", defaults["sleep_max"]),
-        "timeout": args.timeout if args.timeout is not None else config.get("timeout", defaults["timeout"]),
-        "retries": args.retries if args.retries is not None else config.get("retries", defaults["retries"]),
+        "max_pages": (
+            args.max_pages
+            if args.max_pages is not None
+            else config.get("max_pages", defaults["max_pages"])
+        ),
+        "sleep_min": (
+            args.sleep_min
+            if args.sleep_min is not None
+            else config.get("sleep_min", defaults["sleep_min"])
+        ),
+        "sleep_max": (
+            args.sleep_max
+            if args.sleep_max is not None
+            else config.get("sleep_max", defaults["sleep_max"])
+        ),
+        "timeout": (
+            args.timeout
+            if args.timeout is not None
+            else config.get("timeout", defaults["timeout"])
+        ),
+        "retries": (
+            args.retries
+            if args.retries is not None
+            else config.get("retries", defaults["retries"])
+        ),
     }
     return resolved
 
@@ -336,7 +404,9 @@ def main(argv: Iterable[str]) -> int:
     )
 
     out_dir = Path(settings["out_dir"])
-    sleep_cfg = SleepConfig(min_s=float(settings["sleep_min"]), max_s=float(settings["sleep_max"]))
+    sleep_cfg = SleepConfig(
+        min_s=float(settings["sleep_min"]), max_s=float(settings["sleep_max"])
+    )
     crawler = Crawler(
         out_dir=out_dir,
         sleep_cfg=sleep_cfg,
