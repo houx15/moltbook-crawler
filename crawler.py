@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
+try:
+    from tqdm import tqdm
+except Exception:  # noqa: BLE001 - optional dependency for progress display
+    tqdm = None
 
 BASE_URL = "https://www.moltbook.com/api/v1"
 DEFAULT_HEADERS = {
@@ -184,7 +188,12 @@ class Crawler:
                 self._save_json(list_path, post_list)
 
             posts = post_list.get("posts") or []
-            for post in posts:
+            iterable = (
+                tqdm(posts, desc=f"Page {page}", unit="post")
+                if tqdm is not None
+                else posts
+            )
+            for post in iterable:
                 post_id = post.get("id")
                 if not post_id:
                     continue
