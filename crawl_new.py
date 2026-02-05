@@ -170,8 +170,31 @@ class NewPostCrawler:
         raise RuntimeError(f"unreachable: {last_exc}")  # pragma: no cover
 
     def _fetch_list(self, offset: int, limit: int) -> Dict[str, Any]:
+        """Fetch list page with retries.
+
+        Returns the response dict even when success=false (clean end-of-data
+        signal).  Only raises on network / timeout errors after all retries
+        are exhausted.
+        """
         url = f"{BASE_URL}/posts?limit={limit}&sort=new&time=all&offset={offset}"
-        return self._get(url)
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                resp = self._session.get(url, timeout=self.timeout)
+                data = resp.json()
+                # success=false means "no data at this offset" — not a transient
+                # error, so return immediately without raising.
+                if data.get("success") is False:
+                    return data
+                resp.raise_for_status()
+                return data
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < self.retries:
+                    time.sleep(0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.25))
+                else:
+                    raise
+        raise RuntimeError(f"unreachable: {last_exc}")  # pragma: no cover
 
     def _fetch_detail(self, post_id: str) -> Dict[str, Any]:
         url = f"{BASE_URL}/posts/{post_id}"
@@ -317,7 +340,6 @@ class NewPostCrawler:
         Stops early when _process_post returns True (reached_known).
         """
         offset = start_offset
-        pages_done = 0
         for page_num in range(1, max_pages + 1) if max_pages > 0 else iter(int, 1):
             page_label = (
                 f"[{phase}] page {page_num}/{max_pages}"
@@ -326,15 +348,26 @@ class NewPostCrawler:
             )
             print(f"{page_label}  offset={offset}", file=sys.stderr)
 
-            # --- fetch list page (may raise) ---
+            # --- fetch list page (may raise on network error) ---
             post_list = self._fetch_list(offset, limit)
+
+            # --- success=false → end of data, persist and stop cleanly ---
+            if post_list.get("success") is False:
+                print(
+                    f"{page_label}  success=false: {post_list.get('error', '?')} "
+                    f"— end of data. "
+                    f"(total_posts={self._total_posts}, total_comments={self._total_comments})",
+                    file=sys.stderr,
+                )
+                self._save_status(offset, phase)
+                return
 
             # --- persist raw list with timestamp suffix ---
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             self._write_json(self._raw_lists / f"offset_{offset}_{ts}.json", post_list)
 
             posts = post_list.get("posts") or []
-            has_next = post_list.get("next_offset") is not None
+            print(f"{page_label}  got {len(posts)} posts", file=sys.stderr)
 
             # --- process posts (with tqdm if available) ---
             iterable = (
@@ -345,15 +378,14 @@ class NewPostCrawler:
             reached_known = False
             for post in iterable:
                 if self._process_post(post):
-                    reached_known = True
-                    break
+                    if phase == "poll":
+                        reached_known = True
+                        break
+                    # cold_start: post already on disk, just skip it
 
-            pages_done += 1
-
-            # --- advance offset & persist status after every page ---
-            next_offset = int(post_list.get("next_offset") or (offset + limit))
-            self._save_status(next_offset, phase)
-            offset = next_offset
+            # --- always advance by limit; never trust next_offset ---
+            offset += limit
+            self._save_status(offset, phase)
 
             if reached_known:
                 print(
@@ -362,21 +394,6 @@ class NewPostCrawler:
                     file=sys.stderr,
                 )
                 return
-
-            if not post_list.get("has_more"):
-                print(
-                    f"{page_label}  has_more=false"
-                    + ("" if has_next else ", next_offset missing")
-                    + f" — stopping. (total_posts={self._total_posts}, total_comments={self._total_comments})",
-                    file=sys.stderr,
-                )
-                return
-
-            if not has_next:
-                print(
-                    f"{page_label}  WARNING: next_offset missing, falling back to offset + limit",
-                    file=sys.stderr,
-                )
 
             # gap between list pages
             self._sleep()
