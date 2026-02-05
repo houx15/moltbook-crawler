@@ -149,6 +149,10 @@ class Crawler:
         sort: str,
         max_pages: int,
         crawler_id: str,
+        continuous: bool = False,
+        restart_wait_s: float = 3600.0,
+        cold_start_pages: int = 0,
+        cold_start_limit: Optional[int] = None,
     ) -> None:
         raw_lists_dir = self.out_dir / "raw" / "postlists"
         raw_posts_dir = self.out_dir / "raw" / "posts"
@@ -163,6 +167,7 @@ class Crawler:
         status = self._load_status(status_path) if self.resume else {}
         total_posts = int(status.get("total_posts", 0)) if self.resume else 0
         total_comments = int(status.get("total_comments", 0)) if self.resume else 0
+        cold_start_complete = bool(status.get("cold_start_complete")) if self.resume else False
         if self.resume and "current_offset" in status:
             offset = int(status.get("current_offset", offset))
         if self.resume and "current_sort" in status:
@@ -170,98 +175,165 @@ class Crawler:
         if self.resume and "current_limit" in status:
             limit = int(status.get("current_limit", limit))
 
-        page = 0
-        has_more = True
-        current_offset = offset
+        def _parse_created_at(value: Optional[str]) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                if value.endswith("Z"):
+                    value = value[:-1] + "+00:00"
+                return datetime.fromisoformat(value)
+            except Exception:
+                return None
 
-        while has_more and (max_pages <= 0 or page < max_pages):
-            page += 1
-            list_path = raw_lists_dir / f"offset_{current_offset}.json"
+        while True:
+            page = 0
+            has_more = True
+            reached_known = False
+            current_offset = offset if sort != "new" else 0
+            cycle_limit = limit
+            cycle_max_pages = max_pages
 
-            if list_path.exists() and not self.force:
-                with list_path.open("r", encoding="utf-8") as f:
-                    post_list = json.load(f)
-            else:
-                post_list = self.fetch_post_list(
-                    limit=limit, offset=current_offset, sort=sort
-                )
-                self._save_json(list_path, post_list)
+            if sort == "new" and not cold_start_complete and cold_start_pages > 0:
+                cycle_limit = cold_start_limit or limit
+                cycle_max_pages = cold_start_pages
 
-            posts = post_list.get("posts") or []
-            iterable = (
-                tqdm(posts, desc=f"Page {page}", unit="post")
-                if tqdm is not None
-                else posts
-            )
-            for post in iterable:
-                post_id = post.get("id")
-                if not post_id:
-                    continue
-                detail_path = raw_posts_dir / f"{post_id}.json"
-                normalized_path = normalized_dir / f"{post_id}.json"
+            latest_created_at: Optional[datetime] = None
+            latest_post_id: Optional[str] = None
 
-                if normalized_path.exists() and not self.force:
-                    continue
+            while has_more and (cycle_max_pages <= 0 or page < cycle_max_pages):
+                page += 1
+                list_path = raw_lists_dir / f"offset_{current_offset}.json"
 
-                if detail_path.exists() and not self.force:
-                    with detail_path.open("r", encoding="utf-8") as f:
-                        detail = json.load(f)
+                use_cache = list_path.exists() and not self.force and sort != "new"
+                if use_cache:
+                    with list_path.open("r", encoding="utf-8") as f:
+                        post_list = json.load(f)
                 else:
-                    try:
-                        detail = self.fetch_post_detail(post_id)
-                    except Exception as exc:  # noqa: BLE001 - keep crawl moving
-                        print(
-                            f"Failed to fetch detail for {post_id}: {exc}",
-                            file=sys.stderr,
-                        )
-                        continue
-                    self._save_json(detail_path, detail)
-
-                normalized = self.normalize_post_bundle(
-                    detail, f"{BASE_URL}/posts/{post_id}"
-                )
-                self._save_json(normalized_path, normalized)
-
-                with index_path.open("a", encoding="utf-8") as f:
-                    f.write(
-                        json.dumps(
-                            {
-                                "id": post_id,
-                                "title": post.get("title"),
-                                "created_at": post.get("created_at"),
-                                "submolt": post.get("submolt"),
-                                "comment_count": post.get("comment_count"),
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
+                    post_list = self.fetch_post_list(
+                        limit=cycle_limit, offset=current_offset, sort=sort
                     )
+                    self._save_json(list_path, post_list)
 
-                total_posts += 1
-                total_comments += len(normalized.get("comments") or [])
+                posts = post_list.get("posts") or []
+                for post in posts:
+                    created_at = _parse_created_at(post.get("created_at"))
+                    if created_at and (
+                        latest_created_at is None or created_at > latest_created_at
+                    ):
+                        latest_created_at = created_at
+                        latest_post_id = post.get("id")
+
+                iterable = (
+                    tqdm(posts, desc=f"Page {page}", unit="post")
+                    if tqdm is not None
+                    else posts
+                )
+                for post in iterable:
+                    post_id = post.get("id")
+                    if not post_id:
+                        continue
+                    detail_path = raw_posts_dir / f"{post_id}.json"
+                    normalized_path = normalized_dir / f"{post_id}.json"
+
+                    if normalized_path.exists() and not self.force:
+                        if sort == "new":
+                            reached_known = True
+                            break
+                        continue
+
+                    if detail_path.exists() and not self.force:
+                        with detail_path.open("r", encoding="utf-8") as f:
+                            detail = json.load(f)
+                    else:
+                        try:
+                            detail = self.fetch_post_detail(post_id)
+                        except Exception as exc:  # noqa: BLE001 - keep crawl moving
+                            print(
+                                f"Failed to fetch detail for {post_id}: {exc}",
+                                file=sys.stderr,
+                            )
+                            continue
+                        self._save_json(detail_path, detail)
+
+                    normalized = self.normalize_post_bundle(
+                        detail, f"{BASE_URL}/posts/{post_id}"
+                    )
+                    self._save_json(normalized_path, normalized)
+
+                    with index_path.open("a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "id": post_id,
+                                    "title": post.get("title"),
+                                    "created_at": post.get("created_at"),
+                                    "submolt": post.get("submolt"),
+                                    "comment_count": post.get("comment_count"),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+
+                    total_posts += 1
+                    total_comments += len(normalized.get("comments") or [])
+                    self.sleep_cfg.sleep()
+
+                if reached_known:
+                    has_more = False
+                else:
+                    has_more = bool(post_list.get("has_more"))
+                current_offset = int(
+                    post_list.get("next_offset") or (current_offset + cycle_limit)
+                )
+
+                self._save_json(
+                    status_path,
+                    {
+                        "total_posts": total_posts,
+                        "total_comments": total_comments,
+                        "current_offset": current_offset,
+                        "current_sort": sort,
+                        "current_limit": cycle_limit,
+                        "has_more": has_more,
+                        "crawler_id": crawler_id,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "latest_post_created_at": latest_created_at.isoformat()
+                        if latest_created_at
+                        else None,
+                        "latest_post_id": latest_post_id,
+                        "cold_start_complete": cold_start_complete,
+                    },
+                )
+
+                # Gap between list pages
                 self.sleep_cfg.sleep()
 
-            has_more = bool(post_list.get("has_more"))
-            current_offset = int(
-                post_list.get("next_offset") or (current_offset + limit)
-            )
+            if sort == "new" and not cold_start_complete and cold_start_pages > 0:
+                cold_start_complete = True
+                self._save_json(
+                    status_path,
+                    {
+                        "total_posts": total_posts,
+                        "total_comments": total_comments,
+                        "current_offset": current_offset,
+                        "current_sort": sort,
+                        "current_limit": cycle_limit,
+                        "has_more": has_more,
+                        "crawler_id": crawler_id,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "latest_post_created_at": latest_created_at.isoformat()
+                        if latest_created_at
+                        else None,
+                        "latest_post_id": latest_post_id,
+                        "cold_start_complete": cold_start_complete,
+                    },
+                )
 
-            self._save_json(
-                status_path,
-                {
-                    "total_posts": total_posts,
-                    "total_comments": total_comments,
-                    "current_offset": current_offset,
-                    "current_sort": sort,
-                    "current_limit": limit,
-                    "has_more": has_more,
-                    "crawler_id": crawler_id,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
+            if not continuous or sort != "new":
+                break
 
-            # Gap between list pages
-            self.sleep_cfg.sleep()
+            time.sleep(restart_wait_s)
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
@@ -293,6 +365,48 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--retries", type=int, default=None, help="Max retries per request"
+    )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        default=None,
+        help="Continuously crawl (restart loop for new sort)",
+    )
+    parser.add_argument(
+        "--no-continuous",
+        action="store_false",
+        dest="continuous",
+        help="Disable continuous crawl",
+    )
+    parser.add_argument(
+        "--restart-wait",
+        type=float,
+        default=None,
+        help="Seconds to wait before restarting from offset 0",
+    )
+    parser.add_argument(
+        "--cold-start-pages",
+        type=int,
+        default=None,
+        help="Pages to crawl for cold start",
+    )
+    parser.add_argument(
+        "--cold-start-limit",
+        type=int,
+        default=None,
+        help="Posts per page during cold start",
+    )
+    parser.add_argument(
+        "--separate-by-sort",
+        action="store_true",
+        default=None,
+        help="Store data in a per-sort subdirectory",
+    )
+    parser.add_argument(
+        "--no-separate-by-sort",
+        action="store_false",
+        dest="separate_by_sort",
+        help="Disable per-sort output directory",
     )
     parser.add_argument(
         "--force", action="store_true", help="Re-download existing files"
@@ -331,7 +445,7 @@ def _write_config(path: Path, data: Dict[str, Any]) -> None:
 def _resolve_settings(
     args: argparse.Namespace, config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    defaults = {
+    base_defaults = {
         "crawler_id": "default",
         "out_dir": "data",
         "limit": 1000,
@@ -342,7 +456,27 @@ def _resolve_settings(
         "sleep_max": 2.5,
         "timeout": 20.0,
         "retries": 3,
+        "continuous": False,
+        "restart_wait": 3600.0,
+        "cold_start_pages": 0,
+        "cold_start_limit": None,
+        "separate_by_sort": False,
     }
+
+    resolved_sort = args.sort or config.get("sort") or base_defaults["sort"]
+    defaults = dict(base_defaults)
+    if resolved_sort == "new":
+        defaults.update(
+            {
+                "limit": 100,
+                "max_pages": 0,
+                "continuous": True,
+                "restart_wait": 3600.0,
+                "cold_start_pages": 100,
+                "cold_start_limit": 500,
+                "separate_by_sort": True,
+            }
+        )
 
     resolved = {
         "crawler_id": args.crawler_id
@@ -385,6 +519,31 @@ def _resolve_settings(
             if args.retries is not None
             else config.get("retries", defaults["retries"])
         ),
+        "continuous": (
+            args.continuous
+            if args.continuous is not None
+            else config.get("continuous", defaults["continuous"])
+        ),
+        "restart_wait": (
+            args.restart_wait
+            if args.restart_wait is not None
+            else config.get("restart_wait", defaults["restart_wait"])
+        ),
+        "cold_start_pages": (
+            args.cold_start_pages
+            if args.cold_start_pages is not None
+            else config.get("cold_start_pages", defaults["cold_start_pages"])
+        ),
+        "cold_start_limit": (
+            args.cold_start_limit
+            if args.cold_start_limit is not None
+            else config.get("cold_start_limit", defaults["cold_start_limit"])
+        ),
+        "separate_by_sort": (
+            args.separate_by_sort
+            if args.separate_by_sort is not None
+            else config.get("separate_by_sort", defaults["separate_by_sort"])
+        ),
     }
     return resolved
 
@@ -408,11 +567,18 @@ def main(argv: Iterable[str]) -> int:
             "sleep_max": settings["sleep_max"],
             "timeout": settings["timeout"],
             "retries": settings["retries"],
+            "continuous": settings["continuous"],
+            "restart_wait": settings["restart_wait"],
+            "cold_start_pages": settings["cold_start_pages"],
+            "cold_start_limit": settings["cold_start_limit"],
+            "separate_by_sort": settings["separate_by_sort"],
             "updated_at": datetime.now(timezone.utc).isoformat(),
         },
     )
 
     out_dir = Path(settings["out_dir"])
+    if settings["separate_by_sort"] and settings["sort"] != "hot":
+        out_dir = out_dir / str(settings["sort"])
     sleep_cfg = SleepConfig(
         min_s=float(settings["sleep_min"]), max_s=float(settings["sleep_max"])
     )
@@ -432,6 +598,14 @@ def main(argv: Iterable[str]) -> int:
             sort=str(settings["sort"]),
             max_pages=int(settings["max_pages"]),
             crawler_id=str(settings["crawler_id"]),
+            continuous=bool(settings["continuous"]),
+            restart_wait_s=float(settings["restart_wait"]),
+            cold_start_pages=int(settings["cold_start_pages"]),
+            cold_start_limit=(
+                int(settings["cold_start_limit"])
+                if settings["cold_start_limit"] is not None
+                else None
+            ),
         )
     except requests.HTTPError as exc:
         print(f"HTTP error: {exc}", file=sys.stderr)
