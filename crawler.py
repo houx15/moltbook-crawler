@@ -192,17 +192,17 @@ class Crawler:
             page = 0
             has_more = True
             reached_known = False
-            current_offset = offset if sort != "new" else 0
+            error_occurred = False
+            # After cold start, always restart from 0 to catch new posts.
+            # During cold start, resume from saved offset so an error mid-way
+            # does not throw away progress.
+            current_offset = 0 if (sort == "new" and cold_start_complete) else offset
             cycle_limit = limit
             cycle_max_pages = max_pages
 
             if sort == "new" and not cold_start_complete and cold_start_pages > 0:
                 cycle_limit = cold_start_limit or limit
                 cycle_max_pages = cold_start_pages
-
-            print(
-                f"args: max_pages: {max_pages}, cold_start_pages: {cold_start_pages}, cold_start_limit: {cold_start_limit}"
-            )
 
             latest_created_at: Optional[datetime] = None
             latest_post_id: Optional[str] = None
@@ -220,9 +220,17 @@ class Crawler:
                     with list_path.open("r", encoding="utf-8") as f:
                         post_list = json.load(f)
                 else:
-                    post_list = self.fetch_post_list(
-                        limit=cycle_limit, offset=current_offset, sort=sort
-                    )
+                    try:
+                        post_list = self.fetch_post_list(
+                            limit=cycle_limit, offset=current_offset, sort=sort
+                        )
+                    except Exception as exc:  # noqa: BLE001 - allow crawl to restart
+                        print(
+                            f"Failed to fetch page {page} (offset {current_offset}): {exc}",
+                            file=sys.stderr,
+                        )
+                        error_occurred = True
+                        break
                     self._save_json(list_path, post_list)
 
                 posts = post_list.get("posts") or []
@@ -294,7 +302,6 @@ class Crawler:
                     has_more = False
                 else:
                     has_more = bool(post_list.get("has_more"))
-                    print(f"has_more: {has_more}")
                 current_offset = int(
                     post_list.get("next_offset") or (current_offset + cycle_limit)
                 )
@@ -321,7 +328,16 @@ class Crawler:
                 # Gap between list pages
                 self.sleep_cfg.sleep()
 
-            if sort == "new" and not cold_start_complete and cold_start_pages > 0:
+            # Keep offset in sync so the next outer-loop iteration (after an
+            # error during cold start) resumes from the right place.
+            offset = current_offset
+
+            if (
+                not error_occurred
+                and sort == "new"
+                and not cold_start_complete
+                and cold_start_pages > 0
+            ):
                 cold_start_complete = True
                 self._save_json(
                     status_path,
@@ -345,7 +361,14 @@ class Crawler:
             if not continuous or sort != "new":
                 break
 
-            time.sleep(restart_wait_s)
+            if error_occurred:
+                backoff = random.uniform(30, 60)
+                print(
+                    f"Restarting after error in {backoff:.0f}s …", file=sys.stderr
+                )
+                time.sleep(backoff)
+            else:
+                time.sleep(restart_wait_s)
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:

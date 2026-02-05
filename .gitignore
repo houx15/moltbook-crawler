@@ -1,0 +1,15 @@
+# output data
+data/
+/mnt/
+
+# crawler state
+status_*.json
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# IDE
+.vscode/
+.idea/

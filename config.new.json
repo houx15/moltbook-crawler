@@ -1,0 +1,11 @@
+{
+  "out_dir": "/mnt/disk-ccc-covid3-llm/moltbook/new",
+  "cold_start_pages": 500,
+  "cold_start_limit": 100,
+  "poll_limit": 100,
+  "sleep_min": 0.8,
+  "sleep_max": 2.5,
+  "timeout": 20.0,
+  "retries": 3,
+  "poll_interval": 3600.0
+}
