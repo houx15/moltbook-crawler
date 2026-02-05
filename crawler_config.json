@@ -1,7 +1,7 @@
 {
-  "crawler_id": "default",
-  "out_dir": "data",
-  "limit": 1000,
+  "crawler_id": "hot",
+  "out_dir": "/mnt/disk-ccc-covid3-llm/moltbook",
+  "limit": 10000,
   "offset": 0,
   "sort": "hot",
   "max_pages": 0,
@@ -9,5 +9,5 @@
   "sleep_max": 5,
   "timeout": 20.0,
   "retries": 3,
-  "updated_at": "2026-02-01T00:00:00+00:00"
+  "updated_at": "2026-02-03T14:22:44.663645+00:00"
 }
