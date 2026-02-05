@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
+
 try:
     from tqdm import tqdm
 except Exception:  # noqa: BLE001 - optional dependency for progress display
@@ -167,7 +168,9 @@ class Crawler:
         status = self._load_status(status_path) if self.resume else {}
         total_posts = int(status.get("total_posts", 0)) if self.resume else 0
         total_comments = int(status.get("total_comments", 0)) if self.resume else 0
-        cold_start_complete = bool(status.get("cold_start_complete")) if self.resume else False
+        cold_start_complete = (
+            bool(status.get("cold_start_complete")) if self.resume else False
+        )
         if self.resume and "current_offset" in status:
             offset = int(status.get("current_offset", offset))
         if self.resume and "current_sort" in status:
@@ -196,6 +199,10 @@ class Crawler:
             if sort == "new" and not cold_start_complete and cold_start_pages > 0:
                 cycle_limit = cold_start_limit or limit
                 cycle_max_pages = cold_start_pages
+
+            print(
+                f"args: max_pages: {max_pages}, cold_start_pages: {cold_start_pages}, cold_start_limit: {cold_start_limit}"
+            )
 
             latest_created_at: Optional[datetime] = None
             latest_post_id: Optional[str] = None
@@ -287,6 +294,7 @@ class Crawler:
                     has_more = False
                 else:
                     has_more = bool(post_list.get("has_more"))
+                    print(f"has_more: {has_more}")
                 current_offset = int(
                     post_list.get("next_offset") or (current_offset + cycle_limit)
                 )
@@ -302,9 +310,9 @@ class Crawler:
                         "has_more": has_more,
                         "crawler_id": crawler_id,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "latest_post_created_at": latest_created_at.isoformat()
-                        if latest_created_at
-                        else None,
+                        "latest_post_created_at": (
+                            latest_created_at.isoformat() if latest_created_at else None
+                        ),
                         "latest_post_id": latest_post_id,
                         "cold_start_complete": cold_start_complete,
                     },
@@ -326,9 +334,9 @@ class Crawler:
                         "has_more": has_more,
                         "crawler_id": crawler_id,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "latest_post_created_at": latest_created_at.isoformat()
-                        if latest_created_at
-                        else None,
+                        "latest_post_created_at": (
+                            latest_created_at.isoformat() if latest_created_at else None
+                        ),
                         "latest_post_id": latest_post_id,
                         "cold_start_complete": cold_start_complete,
                     },
@@ -476,8 +484,8 @@ def _resolve_settings(
                 "max_pages": 0,
                 "continuous": True,
                 "restart_wait": 3600.0,
-                "cold_start_pages": 100,
-                "cold_start_limit": 500,
+                "cold_start_pages": 500,
+                "cold_start_limit": 100,
                 "separate_by_sort": True,
             }
         )
