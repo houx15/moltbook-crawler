@@ -99,7 +99,7 @@ class Crawler:
             return {}
 
     def fetch_post_list(self, limit: int, offset: int, sort: str) -> Dict[str, Any]:
-        url = f"{BASE_URL}/posts?limit={limit}&sort={sort}&offset={offset}"
+        url = f"{BASE_URL}/posts?limit={limit}&sort={sort}&time=all&offset={offset}"
         return self._request_json(url)
 
     def fetch_post_detail(self, post_id: str) -> Dict[str, Any]:
