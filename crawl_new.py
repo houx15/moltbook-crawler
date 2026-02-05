@@ -25,6 +25,11 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+try:
+    from tqdm import tqdm
+except Exception:  # noqa: BLE001
+    tqdm = None  # type: ignore[assignment, misc]
+
 BASE_URL = "https://www.moltbook.com/api/v1"
 _HEADERS = {
     "User-Agent": "moltbook-crawler/1.0 (+https://www.moltbook.com)",
@@ -312,7 +317,15 @@ class NewPostCrawler:
         Stops early when _process_post returns True (reached_known).
         """
         offset = start_offset
+        pages_done = 0
         for page_num in range(1, max_pages + 1) if max_pages > 0 else iter(int, 1):
+            page_label = (
+                f"[{phase}] page {page_num}/{max_pages}"
+                if max_pages > 0
+                else f"[{phase}] page {page_num}"
+            )
+            print(f"{page_label}  offset={offset}", file=sys.stderr)
+
             # --- fetch list page (may raise) ---
             post_list = self._fetch_list(offset, limit)
 
@@ -321,13 +334,21 @@ class NewPostCrawler:
             self._write_json(self._raw_lists / f"offset_{offset}_{ts}.json", post_list)
 
             posts = post_list.get("posts") or []
+            has_next = post_list.get("next_offset") is not None
 
-            # --- process posts ---
+            # --- process posts (with tqdm if available) ---
+            iterable = (
+                tqdm(posts, desc=page_label, unit="post")
+                if tqdm is not None
+                else posts
+            )
             reached_known = False
-            for post in posts:
+            for post in iterable:
                 if self._process_post(post):
                     reached_known = True
                     break
+
+            pages_done += 1
 
             # --- advance offset & persist status after every page ---
             next_offset = int(post_list.get("next_offset") or (offset + limit))
@@ -335,10 +356,27 @@ class NewPostCrawler:
             offset = next_offset
 
             if reached_known:
-                return  # poll cycle done
+                print(
+                    f"{page_label}  reached known post — stopping. "
+                    f"(total_posts={self._total_posts}, total_comments={self._total_comments})",
+                    file=sys.stderr,
+                )
+                return
 
             if not post_list.get("has_more"):
-                return  # no more pages from API
+                print(
+                    f"{page_label}  has_more=false"
+                    + ("" if has_next else ", next_offset missing")
+                    + f" — stopping. (total_posts={self._total_posts}, total_comments={self._total_comments})",
+                    file=sys.stderr,
+                )
+                return
+
+            if not has_next:
+                print(
+                    f"{page_label}  WARNING: next_offset missing, falling back to offset + limit",
+                    file=sys.stderr,
+                )
 
             # gap between list pages
             self._sleep()
@@ -360,7 +398,11 @@ class NewPostCrawler:
                 # completed without error
                 self._cold_start_complete = True
                 self._save_status(0, "poll")
-                print("[cold_start] complete.", file=sys.stderr)
+                print(
+                    f"[cold_start] complete. total_posts={self._total_posts}, "
+                    f"total_comments={self._total_comments}",
+                    file=sys.stderr,
+                )
                 return
             except Exception as exc:  # noqa: BLE001
                 _log_error_backoff("cold_start", exc)
