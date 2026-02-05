@@ -5,8 +5,13 @@ Phases
 ------
 cold_start – pages 0…cold_start_pages at cold_start_limit posts/page.
              Persisted offset so it resumes after a crash mid-way.
-poll       – restart from offset 0 every poll_interval seconds; stop as
-             soon as a post that already exists on disk is encountered.
+             At completion the newest created_at seen becomes last_update_timestamp.
+poll       – restart from offset 0; stop when a post's created_at is older
+             than last_update_timestamp.  Posts already on disk are skipped
+             (no detail fetch) but do NOT stop the scan — feed drift can
+             surface duplicates anywhere in the page sequence.
+             On completion last_update_timestamp is advanced to the newest
+             created_at seen in this cycle.
 
 Error recovery: list-page fetch failure → log, back off 30-60 s (random),
 resume current phase from the last persisted offset.
@@ -50,6 +55,18 @@ def _log_error_backoff(phase: str, exc: Exception) -> None:
         file=sys.stderr,
     )
     time.sleep(delay)
+
+
+def _parse_ts(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-8601 created_at string into a tz-aware datetime, or None."""
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -145,6 +162,7 @@ class NewPostCrawler:
         self._total_posts = 0
         self._total_comments = 0
         self._cold_start_complete = False
+        self._last_update_timestamp: Optional[datetime] = None
 
         self._session = requests.Session()
         self._session.headers.update(_HEADERS)
@@ -227,6 +245,11 @@ class NewPostCrawler:
                 "cold_start_complete": self._cold_start_complete,
                 "total_posts": self._total_posts,
                 "total_comments": self._total_comments,
+                "last_update_timestamp": (
+                    self._last_update_timestamp.isoformat()
+                    if self._last_update_timestamp
+                    else None
+                ),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -280,19 +303,15 @@ class NewPostCrawler:
         hi = max(self.sleep_min, self.sleep_max)
         time.sleep(random.uniform(lo, hi))
 
-    def _process_post(self, post: Dict[str, Any]) -> bool:
-        """Fetch, normalize, persist one post.
-
-        Returns True if the normalized file already existed on disk
-        (i.e. this is a known post — the caller should stop scanning).
-        """
+    def _process_post(self, post: Dict[str, Any]) -> None:
+        """Fetch, normalize, persist one post.  Silently skips if already on disk."""
         post_id = post.get("id")
         if not post_id:
-            return False
+            return
 
         normalized_path = self._posts_dir / f"{post_id}.json"
         if normalized_path.exists():
-            return True  # reached_known
+            return  # duplicate from feed drift — skip, do NOT stop
 
         # raw detail
         raw_path = self._raw_posts / f"{post_id}.json"
@@ -304,7 +323,7 @@ class NewPostCrawler:
                 detail = self._fetch_detail(post_id)
             except Exception as exc:  # noqa: BLE001
                 print(f"  detail fetch failed for {post_id}: {exc}", file=sys.stderr)
-                return False
+                return
             self._write_json(raw_path, detail)
 
         normalized = self._normalize(detail, post_id)
@@ -329,17 +348,29 @@ class NewPostCrawler:
         self._total_posts += 1
         self._total_comments += len(normalized.get("comments") or [])
         self._sleep()
-        return False
 
     def _scan_pages(
-        self, start_offset: int, limit: int, max_pages: int, phase: str
-    ) -> None:
+        self,
+        start_offset: int,
+        limit: int,
+        max_pages: int,
+        phase: str,
+        last_update_timestamp: Optional[datetime] = None,
+    ) -> Optional[datetime]:
         """Iterate list pages, processing every post.
 
-        Raises on list-fetch failure — caller owns error / backoff.
-        Stops early when _process_post returns True (reached_known).
+        last_update_timestamp – if set (poll phase) scanning stops when a post's
+            created_at falls below this value.  None means no timestamp bound
+            (cold_start — runs until max_pages or success=false).
+
+        Returns the newest created_at seen across the entire scan (or None if
+        no post had a parseable timestamp).
+
+        Raises on list-fetch / network failure — caller owns error / backoff.
         """
         offset = start_offset
+        newest_seen: Optional[datetime] = None
+
         for page_num in range(1, max_pages + 1) if max_pages > 0 else iter(int, 1):
             page_label = (
                 f"[{phase}] page {page_num}/{max_pages}"
@@ -360,7 +391,7 @@ class NewPostCrawler:
                     file=sys.stderr,
                 )
                 self._save_status(offset, phase)
-                return
+                return newest_seen
 
             # --- persist raw list with timestamp suffix ---
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -375,28 +406,39 @@ class NewPostCrawler:
                 if tqdm is not None
                 else posts
             )
-            reached_known = False
+            reached_boundary = False
             for post in iterable:
-                if self._process_post(post):
-                    if phase == "poll":
-                        reached_known = True
-                        break
-                    # cold_start: post already on disk, just skip it
+                created_at = _parse_ts(post.get("created_at"))
+
+                # track the newest timestamp we've seen in this scan
+                if created_at and (newest_seen is None or created_at > newest_seen):
+                    newest_seen = created_at
+
+                # timestamp boundary check (poll only; cold_start passes None)
+                if last_update_timestamp and created_at and created_at < last_update_timestamp:
+                    print(
+                        f"{page_label}  reached timestamp boundary "
+                        f"({created_at.isoformat()} < {last_update_timestamp.isoformat()}) "
+                        f"— stopping. "
+                        f"(total_posts={self._total_posts}, total_comments={self._total_comments})",
+                        file=sys.stderr,
+                    )
+                    reached_boundary = True
+                    break
+
+                self._process_post(post)
 
             # --- always advance by limit; never trust next_offset ---
             offset += limit
             self._save_status(offset, phase)
 
-            if reached_known:
-                print(
-                    f"{page_label}  reached known post — stopping. "
-                    f"(total_posts={self._total_posts}, total_comments={self._total_comments})",
-                    file=sys.stderr,
-                )
-                return
+            if reached_boundary:
+                return newest_seen
 
             # gap between list pages
             self._sleep()
+
+        return newest_seen
 
     # ------------------------------------------------------------------
     # phases
@@ -406,18 +448,22 @@ class NewPostCrawler:
         """Run cold start, catching list-fetch errors and backing off."""
         while True:
             try:
-                self._scan_pages(
+                newest_seen = self._scan_pages(
                     start_offset=resume_offset,
                     limit=self.cold_start_limit,
                     max_pages=self.cold_start_pages,
                     phase="cold_start",
+                    # no timestamp bound — run the full page range
                 )
-                # completed without error
+                # completed without error; anchor = newest post we saw
                 self._cold_start_complete = True
+                if newest_seen:
+                    self._last_update_timestamp = newest_seen
                 self._save_status(0, "poll")
                 print(
                     f"[cold_start] complete. total_posts={self._total_posts}, "
-                    f"total_comments={self._total_comments}",
+                    f"total_comments={self._total_comments}, "
+                    f"last_update_timestamp={self._last_update_timestamp.isoformat() if self._last_update_timestamp else None}",
                     file=sys.stderr,
                 )
                 return
@@ -431,13 +477,23 @@ class NewPostCrawler:
         """Single poll pass from offset 0. Catches errors and backs off."""
         while True:
             try:
-                self._scan_pages(
+                newest_seen = self._scan_pages(
                     start_offset=0,
                     limit=self.poll_limit,
-                    max_pages=0,  # no page cap; stops via reached_known or has_more
+                    max_pages=0,  # no page cap; stops at timestamp boundary
                     phase="poll",
+                    last_update_timestamp=self._last_update_timestamp,
                 )
-                print("[poll] cycle complete.", file=sys.stderr)
+                # advance the anchor to the newest post seen in this cycle
+                if newest_seen:
+                    self._last_update_timestamp = newest_seen
+                self._save_status(0, "poll")
+                print(
+                    f"[poll] cycle complete. "
+                    f"total_posts={self._total_posts}, "
+                    f"last_update_timestamp={self._last_update_timestamp.isoformat() if self._last_update_timestamp else None}",
+                    file=sys.stderr,
+                )
                 return
             except Exception as exc:  # noqa: BLE001
                 _log_error_backoff("poll", exc)
@@ -458,6 +514,7 @@ class NewPostCrawler:
         self._total_posts = int(status.get("total_posts", 0))
         self._total_comments = int(status.get("total_comments", 0))
         self._cold_start_complete = bool(status.get("cold_start_complete", False))
+        self._last_update_timestamp = _parse_ts(status.get("last_update_timestamp"))
 
         # --- cold start (skipped if already done) ---
         if not self._cold_start_complete:
