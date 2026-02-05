@@ -202,7 +202,11 @@ class Crawler:
 
             while has_more and (cycle_max_pages <= 0 or page < cycle_max_pages):
                 page += 1
-                list_path = raw_lists_dir / f"offset_{current_offset}.json"
+                if sort == "new":
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    list_path = raw_lists_dir / f"offset_{current_offset}_{ts}.json"
+                else:
+                    list_path = raw_lists_dir / f"offset_{current_offset}.json"
 
                 use_cache = list_path.exists() and not self.force and sort != "new"
                 if use_cache:
